@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
 VPS Manager - Interactive server management tool
-Manages NGINX, PM2, SSL certificates, and site provisioning
+Manages NGINX, PM2, SSL certificates, site provisioning, and Cloudflare DNS
 """
 
 import os
 import sys
 import time
 import json
+import requests
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
@@ -24,17 +25,362 @@ try:
     from rich.text import Text
 except ImportError:
     print("Missing dependencies. Install with:")
-    print("  pip install paramiko rich")
+    print("  pip install paramiko rich requests")
     sys.exit(1)
+
+
+# ============================================================================
+# CONFIGURATION - Edit these values OR set environment variables
+# ============================================================================
+# Environment variables take precedence over hardcoded values below.
+# To set environment variables, run: ./setup-env.sh
+#
+# Required environment variables:
+#   - CLOUDFLARE_API_TOKEN: Cloudflare API token for DNS management
+#   - VPS_SRV1_IP: VPS server IP address
+#   - VPS_SRV1_PORT: VPS SSH port
+#
+# Optional environment variables:
+#   - CLAUDE_API_KEY: Claude API key (for future features)
+#   - DEEPSEEK_API_KEY: DeepSeek API key (for future features)
+# ============================================================================
+
+# VPS Server Configuration
+VPS_HOST = os.environ.get('VPS_SRV1_IP', "23.29.114.83")
+VPS_SSH_USERNAME = "beinejd"  # Update this to your SSH username
+VPS_SSH_PORT = int(os.environ.get('VPS_SRV1_PORT', "22"))
+
+# Cloudflare API Configuration
+# Get your API token from: https://dash.cloudflare.com/profile/api-tokens
+# Required permission: Zone:DNS:Edit + Zone:Zone:Edit (for zone creation)
+CLOUDFLARE_API_TOKEN = os.environ.get('CLOUDFLARE_API_TOKEN', "")
+
+# AI API Keys (for future features)
+CLAUDE_API_KEY = os.environ.get('CLAUDE_API_KEY', "")
+DEEPSEEK_API_KEY = os.environ.get('DEEPSEEK_API_KEY', "")
+
+# ============================================================================
+
+
+class CloudflareManager:
+    """Manages Cloudflare DNS via API"""
+    
+    def __init__(self, api_token: str):
+        self.api_token = api_token
+        self.base_url = "https://api.cloudflare.com/client/v4"
+        self.headers = {
+            "Authorization": f"Bearer {api_token}",
+            "Content-Type": "application/json"
+        }
+        self.console = Console()
+        self._zone_cache = {}  # Cache zone IDs by domain
+        
+        # Debug: Show token is being set
+        self.console.print(f"[dim]CloudflareManager initialized with token: {api_token[:8]}...{api_token[-4:]}[/dim]")
+    
+    def verify_credentials(self) -> bool:
+        """Verify API token is valid"""
+        try:
+            response = requests.get(
+                f"{self.base_url}/user/tokens/verify",
+                headers=self.headers,
+                timeout=10
+            )
+            
+            # Debug output
+            if response.status_code != 200:
+                self.console.print(f"[yellow]API Response Status: {response.status_code}[/yellow]")
+                self.console.print(f"[yellow]Response: {response.text[:200]}[/yellow]")
+                return False
+            
+            result = response.json()
+            if not result.get('success', False):
+                self.console.print(f"[yellow]API returned success=false[/yellow]")
+                self.console.print(f"[yellow]Response: {result}[/yellow]")
+                return False
+            
+            return True
+            
+        except requests.exceptions.RequestException as e:
+            self.console.print(f"[red]Network error: {e}[/red]")
+            return False
+        except Exception as e:
+            self.console.print(f"[red]Cloudflare API error: {e}[/red]")
+            return False
+    
+    def get_root_domain(self, domain: str) -> str:
+        """Extract root domain from subdomain (e.g., www.example.com -> example.com)"""
+        parts = domain.split('.')
+        if len(parts) >= 2:
+            # Return last two parts (handles example.com, www.example.com, etc.)
+            return '.'.join(parts[-2:])
+        return domain
+    
+    def find_zone_by_domain(self, domain: str) -> Optional[Dict]:
+        """Find a zone by domain name"""
+        root_domain = self.get_root_domain(domain)
+        
+        # Check cache first
+        if root_domain in self._zone_cache:
+            return self._zone_cache[root_domain]
+        
+        try:
+            response = requests.get(
+                f"{self.base_url}/zones",
+                headers=self.headers,
+                params={"name": root_domain},
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                zones = result.get('result', [])
+                if zones:
+                    zone = zones[0]
+                    # Cache the zone
+                    self._zone_cache[root_domain] = zone
+                    return zone
+            
+            return None
+        except Exception as e:
+            self.console.print(f"[red]Error finding zone: {e}[/red]")
+            return None
+    
+    def create_zone(self, domain: str) -> Optional[Dict]:
+        """Create a new zone in Cloudflare"""
+        root_domain = self.get_root_domain(domain)
+        
+        try:
+            data = {
+                "name": root_domain,
+                "jump_start": True  # Auto-scan for DNS records
+            }
+            
+            response = requests.post(
+                f"{self.base_url}/zones",
+                headers=self.headers,
+                json=data,
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                zone = result.get('result')
+                if zone:
+                    self.console.print(f"[green]✓ Created Cloudflare zone: {root_domain}[/green]")
+                    # Cache the zone
+                    self._zone_cache[root_domain] = zone
+                    return zone
+            else:
+                error_msg = response.json().get('errors', [{}])[0].get('message', 'Unknown error')
+                self.console.print(f"[red]Failed to create zone: {error_msg}[/red]")
+                return None
+        except Exception as e:
+            self.console.print(f"[red]Error creating zone: {e}[/red]")
+            return None
+    
+    def get_or_create_zone(self, domain: str) -> Optional[str]:
+        """Get zone ID for domain, creating zone if it doesn't exist. Returns zone_id."""
+        root_domain = self.get_root_domain(domain)
+        
+        # Try to find existing zone
+        zone = self.find_zone_by_domain(root_domain)
+        
+        if zone:
+            self.console.print(f"[cyan]Found existing zone: {root_domain}[/cyan]")
+            return zone['id']
+        
+        # Zone doesn't exist, create it
+        self.console.print(f"[yellow]Zone not found for {root_domain}, creating...[/yellow]")
+        zone = self.create_zone(root_domain)
+        
+        if zone:
+            return zone['id']
+        
+        self.console.print(f"[red]Failed to get or create zone for {root_domain}[/red]")
+        return None
+    
+    def get_zone_id(self, domain: str) -> Optional[str]:
+        """Get zone ID for a domain (must already exist)"""
+        zone = self.find_zone_by_domain(domain)
+        return zone['id'] if zone else None
+    
+    def list_dns_records(self, domain: str) -> List[Dict]:
+        """List DNS records for a domain"""
+        zone_id = self.get_zone_id(domain)
+        if not zone_id:
+            self.console.print(f"[red]No zone found for {domain}[/red]")
+            return []
+        
+        try:
+            params = {"name": domain}
+            
+            response = requests.get(
+                f"{self.base_url}/zones/{zone_id}/dns_records",
+                headers=self.headers,
+                params=params,
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                return response.json()['result']
+            else:
+                self.console.print(f"[red]Failed to list DNS records: {response.status_code}[/red]")
+                return []
+        except Exception as e:
+            self.console.print(f"[red]Error listing DNS records: {e}[/red]")
+            return []
+    
+    def create_a_record(self, name: str, ip_address: str, proxied: bool = True) -> bool:
+        """Create an A record (auto-creates zone if needed)"""
+        zone_id = self.get_or_create_zone(name)
+        if not zone_id:
+            return False
+        
+        try:
+            data = {
+                "type": "A",
+                "name": name,
+                "content": ip_address,
+                "ttl": 1,  # Auto (required when proxied=True)
+                "proxied": proxied
+            }
+            
+            response = requests.post(
+                f"{self.base_url}/zones/{zone_id}/dns_records",
+                headers=self.headers,
+                json=data,
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                self.console.print(f"[green]✓ Created DNS A record: {name} → {ip_address}[/green]")
+                return True
+            elif response.status_code == 400:
+                error_msg = response.json().get('errors', [{}])[0].get('message', 'Unknown error')
+                if 'already exists' in error_msg.lower():
+                    self.console.print(f"[yellow]DNS record {name} already exists[/yellow]")
+                    return True  # Consider existing record as success
+                else:
+                    self.console.print(f"[red]Failed to create DNS record: {error_msg}[/red]")
+                    return False
+            else:
+                self.console.print(f"[red]Failed to create DNS record: {response.status_code}[/red]")
+                return False
+        except Exception as e:
+            self.console.print(f"[red]Error creating DNS record: {e}[/red]")
+            return False
+    
+    def update_a_record(self, record_id: str, name: str, ip_address: str, proxied: bool = True) -> bool:
+        """Update an existing A record"""
+        zone_id = self.get_zone_id(name)
+        if not zone_id:
+            return False
+        
+        try:
+            data = {
+                "type": "A",
+                "name": name,
+                "content": ip_address,
+                "ttl": 1,
+                "proxied": proxied
+            }
+            
+            response = requests.put(
+                f"{self.base_url}/zones/{zone_id}/dns_records/{record_id}",
+                headers=self.headers,
+                json=data,
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                self.console.print(f"[green]✓ Updated DNS A record: {name} → {ip_address}[/green]")
+                return True
+            else:
+                self.console.print(f"[red]Failed to update DNS record: {response.status_code}[/red]")
+                return False
+        except Exception as e:
+            self.console.print(f"[red]Error updating DNS record: {e}[/red]")
+            return False
+    
+    def delete_dns_record(self, record_id: str, domain: str) -> bool:
+        """Delete a DNS record"""
+        zone_id = self.get_zone_id(domain)
+        if not zone_id:
+            return False
+        
+        try:
+            response = requests.delete(
+                f"{self.base_url}/zones/{zone_id}/dns_records/{record_id}",
+                headers=self.headers,
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                self.console.print(f"[green]✓ Deleted DNS record[/green]")
+                return True
+            else:
+                self.console.print(f"[red]Failed to delete DNS record: {response.status_code}[/red]")
+                return False
+        except Exception as e:
+            self.console.print(f"[red]Error deleting DNS record: {e}[/red]")
+            return False
+    
+    def get_record_by_name(self, name: str) -> Optional[Dict]:
+        """Get a DNS record by name"""
+        records = self.list_dns_records(domain=name)
+        return records[0] if records else None
+    
+    def ensure_a_record(self, name: str, ip_address: str, proxied: bool = True) -> bool:
+        """Create or update A record to ensure it points to the correct IP"""
+        existing = self.get_record_by_name(name)
+        
+        if existing:
+            if existing['content'] == ip_address and existing.get('proxied') == proxied:
+                self.console.print(f"[cyan]DNS record {name} already correctly configured[/cyan]")
+                return True
+            else:
+                self.console.print(f"[yellow]Updating DNS record {name}...[/yellow]")
+                return self.update_a_record(existing['id'], name, ip_address, proxied)
+        else:
+            return self.create_a_record(name, ip_address, proxied)
+    
+    def verify_dns_propagation(self, domain: str, expected_ip: str, timeout: int = 60) -> bool:
+        """Verify DNS has propagated (check via Cloudflare API)"""
+        import socket
+        
+        self.console.print(f"[cyan]Verifying DNS propagation for {domain}...[/cyan]")
+        
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            try:
+                # Check via DNS resolution
+                resolved_ip = socket.gethostbyname(domain)
+                if resolved_ip == expected_ip:
+                    self.console.print(f"[green]✓ DNS propagated: {domain} → {expected_ip}[/green]")
+                    return True
+                else:
+                    self.console.print(f"[yellow]DNS resolves to {resolved_ip}, waiting for {expected_ip}...[/yellow]")
+            except socket.gaierror:
+                self.console.print(f"[yellow]DNS not yet resolvable, waiting...[/yellow]")
+            
+            time.sleep(5)
+        
+        self.console.print(f"[red]DNS verification timed out after {timeout}s[/red]")
+        return False
 
 
 class VPSManager:
     """Manages SSH connection and VPS operations"""
     
-    def __init__(self, host: str, username: str, port: int = 22):
+    # PM2 path configuration (update if Node version changes)
+    PM2_PATH = "/home/deployer/.nvm/versions/node/v24.11.1/bin/pm2"
+    
+    def __init__(self, host: str, username: str, port: int = 22, cloudflare: Optional['CloudflareManager'] = None):
         self.host = host
         self.username = username
         self.port = port
+        self.cloudflare = cloudflare
         self.ssh_client: Optional[paramiko.SSHClient] = None
         self.console = Console()
         
@@ -102,24 +448,18 @@ class VPSManager:
         pg_out, _, exit_code = self.execute("systemctl is-active postgresql")
         stats['postgresql_running'] = exit_code == 0 and pg_out.strip() == 'active'
         
-        # PM2 status (as deployer user - need proper environment)
-        pm2_cmd = "sudo -i -u deployer pm2 jlist"
+        # PM2 status (as deployer user - use full NVM path)
+        pm2_cmd = f"sudo -u deployer {self.PM2_PATH} jlist"
         pm2_out, pm2_err, _ = self.execute(pm2_cmd)
         try:
             pm2_data = json.loads(pm2_out) if pm2_out.strip() else []
             stats['pm2_processes'] = len(pm2_data)
             stats['pm2_running'] = sum(1 for p in pm2_data if p.get('pm2_env', {}).get('status') == 'online')
         except Exception as e:
-            # Fallback: try with explicit PATH
-            pm2_cmd_fallback = "sudo -i -u deployer bash -l -c 'pm2 jlist'"
-            pm2_out, _, _ = self.execute(pm2_cmd_fallback)
-            try:
-                pm2_data = json.loads(pm2_out) if pm2_out.strip() else []
-                stats['pm2_processes'] = len(pm2_data)
-                stats['pm2_running'] = sum(1 for p in pm2_data if p.get('pm2_env', {}).get('status') == 'online')
-            except:
-                stats['pm2_processes'] = 0
-                stats['pm2_running'] = 0
+            # Debug: show what went wrong
+            stats['pm2_processes'] = 0
+            stats['pm2_running'] = 0
+            stats['pm2_error'] = str(e)
         
         return stats
     
@@ -154,7 +494,7 @@ class VPSManager:
                 site_info['ssl_days_left'] = None
             
             # Check if PM2 app exists for this domain
-            pm2_check_cmd = f"sudo -i -u deployer pm2 show {site_file}"
+            pm2_check_cmd = f"sudo -u deployer {self.PM2_PATH} show {site_file}"
             pm2_out, _, exit_code = self.execute(pm2_check_cmd)
             site_info['pm2_running'] = exit_code == 0 and "online" in pm2_out.lower()
             
@@ -162,8 +502,8 @@ class VPSManager:
         
         return sites
     
-    def provision_site(self, domain: str, enable_www: bool = True, app_port: int = 3000) -> bool:
-        """Provision a new site with NGINX, SSL, and Coming Soon page"""
+    def provision_site(self, domain: str, enable_www: bool = True, app_port: int = 3000, setup_dns: bool = True) -> bool:
+        """Provision a new site with NGINX, SSL, DNS (via Cloudflare), and Coming Soon page"""
         
         self.console.print(f"\n[cyan]Provisioning {domain}...[/cyan]")
         
@@ -172,6 +512,33 @@ class VPSManager:
             TextColumn("[progress.description]{task.description}"),
             console=self.console
         ) as progress:
+            
+            # Step 0: Configure DNS if Cloudflare is available and setup_dns is True
+            if setup_dns and self.cloudflare:
+                task = progress.add_task("Configuring DNS records...", total=None)
+                
+                # Create A record for main domain
+                if not self.cloudflare.ensure_a_record(domain, self.host, proxied=False):
+                    self.console.print("[yellow]Warning: Failed to create main domain DNS record[/yellow]")
+                
+                # Create A record for www subdomain if enabled
+                if enable_www:
+                    www_domain = f"www.{domain}"
+                    if not self.cloudflare.ensure_a_record(www_domain, self.host, proxied=False):
+                        self.console.print("[yellow]Warning: Failed to create www DNS record[/yellow]")
+                
+                progress.update(task, completed=True)
+                
+                # Step 0b: Verify DNS propagation
+                task = progress.add_task("Verifying DNS propagation (this may take a moment)...", total=None)
+                dns_ready = self.cloudflare.verify_dns_propagation(domain, self.host, timeout=60)
+                if not dns_ready:
+                    self.console.print("[yellow]Warning: DNS may not be fully propagated. SSL setup might fail.[/yellow]")
+                    self.console.print("[yellow]You may need to run SSL setup again in a few minutes.[/yellow]")
+                progress.update(task, completed=True)
+            elif setup_dns and not self.cloudflare:
+                self.console.print("[yellow]Cloudflare not configured - skipping DNS setup[/yellow]")
+                self.console.print("[yellow]Please manually configure DNS before SSL will work[/yellow]")
             
             # Step 1: Create directory structure
             task = progress.add_task("Creating directory structure...", total=None)
@@ -546,7 +913,7 @@ server {{
         self.execute("systemctl reload nginx", use_sudo=True)
         
         # Stop PM2 process if running
-        self.execute(f"sudo -i -u deployer pm2 stop {domain}")
+        self.execute(f"sudo -u deployer {self.PM2_PATH} stop {domain}")
         
         self.console.print(f"[green]✓ {domain} is now offline (Coming Soon page active)[/green]")
         return True
@@ -567,7 +934,7 @@ server {{
             
             # Stop PM2 process
             task = progress.add_task("Stopping PM2 process...", total=None)
-            self.execute(f"sudo -i -u deployer pm2 delete {domain}")
+            self.execute(f"sudo -u deployer {self.PM2_PATH} delete {domain}")
             progress.update(task, completed=True)
             
             # Remove NGINX config
@@ -596,7 +963,7 @@ server {{
         self.console.print(f"\n[cyan]Restarting {service}...[/cyan]")
         
         if service == "pm2":
-            _, stderr, exit_code = self.execute("sudo -i -u deployer pm2 restart all")
+            _, stderr, exit_code = self.execute(f"sudo -u deployer {self.PM2_PATH} restart all")
         elif service == "nginx":
             _, stderr, exit_code = self.execute("systemctl restart nginx", use_sudo=True)
         elif service == "postgresql":
@@ -622,6 +989,96 @@ server {{
             self.restart_service(service)
         
         return True
+    
+    def view_dns_records(self, domain: str):
+        """View DNS records for a domain"""
+        if not self.cloudflare:
+            self.console.print("[red]Cloudflare not configured[/red]")
+            return
+        
+        self.console.print(f"\n[cyan]Fetching DNS records for {domain}...[/cyan]")
+        records = self.cloudflare.list_dns_records(domain)
+        
+        if not records:
+            self.console.print("[yellow]No DNS records found[/yellow]")
+            return
+        
+        table = Table(title=f"DNS Records - {domain}", box=box.ROUNDED)
+        table.add_column("Type", style="cyan")
+        table.add_column("Name", style="green")
+        table.add_column("Content", style="yellow")
+        table.add_column("Proxied", justify="center")
+        table.add_column("TTL", justify="center")
+        
+        for record in records:
+            proxied = "🟠" if record.get('proxied') else "⚪"
+            ttl = str(record.get('ttl', 'Auto')) if record.get('ttl') != 1 else "Auto"
+            table.add_row(
+                record['type'],
+                record['name'],
+                record['content'],
+                proxied,
+                ttl
+            )
+        
+        self.console.print(table)
+    
+    def manage_dns_for_site(self, domain: str):
+        """Interactive DNS management for a specific site"""
+        if not self.cloudflare:
+            self.console.print("[red]Cloudflare not configured[/red]")
+            return
+        
+        while True:
+            self.console.clear()
+            self.console.print(f"[bold cyan]DNS Management - {domain}[/bold cyan]\n")
+            
+            # Show current DNS records
+            self.view_dns_records(domain)
+            
+            self.console.print("\n[cyan]Options:[/cyan]")
+            self.console.print("  1. Update DNS to point to this server")
+            self.console.print("  2. Add www subdomain")
+            self.console.print("  3. Delete DNS records")
+            self.console.print("  4. Toggle Cloudflare proxy")
+            self.console.print("  b. Back to main menu")
+            
+            choice = Prompt.ask("\n[cyan]Select an option[/cyan]", choices=["1", "2", "3", "4", "b"])
+            
+            if choice == "1":
+                self.cloudflare.ensure_a_record(domain, self.host, proxied=False)
+                Prompt.ask("\n[dim]Press Enter to continue[/dim]")
+            
+            elif choice == "2":
+                www_domain = f"www.{domain}"
+                self.cloudflare.ensure_a_record(www_domain, self.host, proxied=False)
+                Prompt.ask("\n[dim]Press Enter to continue[/dim]")
+            
+            elif choice == "3":
+                records = self.cloudflare.list_dns_records(domain)
+                if records:
+                    self.console.print("\n[yellow]Delete all DNS records for this domain?[/yellow]")
+                    if Confirm.ask("Are you sure?"):
+                        for record in records:
+                            self.cloudflare.delete_dns_record(record['id'], domain)
+                Prompt.ask("\n[dim]Press Enter to continue[/dim]")
+            
+            elif choice == "4":
+                records = self.cloudflare.list_dns_records(domain)
+                if records:
+                    for record in records:
+                        if record['type'] == 'A':
+                            new_proxied = not record.get('proxied', False)
+                            self.cloudflare.update_a_record(
+                                record['id'],
+                                record['name'],
+                                record['content'],
+                                proxied=new_proxied
+                            )
+                Prompt.ask("\n[dim]Press Enter to continue[/dim]")
+            
+            elif choice == "b":
+                break
 
 
 class MonitorDashboard:
@@ -754,9 +1211,11 @@ def main_menu(vps: VPSManager):
         console.clear()
         
         # Title
+        cf_status = "✓ Connected" if vps.cloudflare and vps.cloudflare.verify_credentials() else "✗ Not configured"
         title = Panel(
-            "[bold cyan]VPS Manager[/bold cyan]\n"
-            f"Connected to: {vps.host}:{vps.port}",
+            f"[bold cyan]VPS Manager[/bold cyan]\n"
+            f"Server: {vps.host}:{vps.port}\n"
+            f"Cloudflare API: {cf_status}",
             style="cyan",
             box=box.DOUBLE
         )
@@ -769,17 +1228,18 @@ def main_menu(vps: VPSManager):
         menu.add_column("Description")
         
         menu.add_row("1", "Live Monitoring Dashboard")
-        menu.add_row("2", "Provision New Site")
-        menu.add_row("3", "Take Site Offline (Park)")
-        menu.add_row("4", "Remove Site Provisioning")
-        menu.add_row("5", "Restart Service")
-        menu.add_row("6", "Restart All Services")
+        menu.add_row("2", "Provision New Site (with DNS)")
+        menu.add_row("3", "Manage DNS Records")
+        menu.add_row("4", "Take Site Offline (Park)")
+        menu.add_row("5", "Remove Site Provisioning")
+        menu.add_row("6", "Restart Service")
+        menu.add_row("7", "Restart All Services")
         menu.add_row("q", "Quit")
         
         console.print(menu)
         console.print()
         
-        choice = Prompt.ask("[cyan]Select an option[/cyan]", choices=["1", "2", "3", "4", "5", "6", "q"])
+        choice = Prompt.ask("[cyan]Select an option[/cyan]", choices=["1", "2", "3", "4", "5", "6", "7", "q"])
         
         if choice == "1":
             # Live monitoring
@@ -790,10 +1250,40 @@ def main_menu(vps: VPSManager):
             # Provision new site
             domain = Prompt.ask("\n[cyan]Enter domain name[/cyan] (e.g., example.com)")
             enable_www = Confirm.ask("Enable www subdomain?", default=True)
-            vps.provision_site(domain, enable_www)
+            
+            if vps.cloudflare:
+                setup_dns = Confirm.ask("Configure DNS via Cloudflare?", default=True)
+            else:
+                setup_dns = False
+                console.print("[yellow]Cloudflare not configured - DNS setup will be skipped[/yellow]")
+            
+            vps.provision_site(domain, enable_www, setup_dns=setup_dns)
             Prompt.ask("\n[dim]Press Enter to continue[/dim]")
         
         elif choice == "3":
+            # DNS management
+            if not vps.cloudflare:
+                console.print("\n[red]Cloudflare API not configured[/red]")
+                console.print("[yellow]To enable DNS management, configure Cloudflare API credentials[/yellow]")
+                Prompt.ask("\n[dim]Press Enter to continue[/dim]")
+                continue
+            
+            console.print("\n[cyan]DNS Management Options:[/cyan]")
+            console.print("  1. View DNS records for domain")
+            console.print("  2. Manage DNS for specific domain")
+            console.print("  3. Back")
+            
+            dns_choice = Prompt.ask("\nSelect option", choices=["1", "2", "3"])
+            
+            if dns_choice == "1":
+                domain = Prompt.ask("\n[cyan]Enter domain name[/cyan]")
+                vps.view_dns_records(domain)
+                Prompt.ask("\n[dim]Press Enter to continue[/dim]")
+            elif dns_choice == "2":
+                domain = Prompt.ask("\n[cyan]Enter domain name[/cyan]")
+                vps.manage_dns_for_site(domain)
+        
+        elif choice == "4":
             # Take site offline
             sites = vps.get_sites()
             if not sites:
@@ -867,21 +1357,66 @@ def main():
     """Main entry point"""
     console = Console()
     
-    # Connection details
-    HOST = "23.29.114.83"
-    USERNAME = "beinejd"
-    PORT = 2223  # TODO: Update with actual SSH port
-    
     console.print("\n[bold cyan]VPS Manager[/bold cyan]")
-    console.print(f"Connecting to {USERNAME}@{HOST}:{PORT}...")
     
-    vps = VPSManager(HOST, USERNAME, PORT)
+    # Show configuration source
+    config_source = []
+    if os.environ.get('VPS_SRV1_IP'):
+        config_source.append("VPS from env")
+    if os.environ.get('CLOUDFLARE_API_TOKEN'):
+        config_source.append("Cloudflare from env")
+    
+    if config_source:
+        console.print(f"[dim]Config: {', '.join(config_source)}[/dim]")
+    
+    console.print(f"Connecting to {VPS_SSH_USERNAME}@{VPS_HOST}:{VPS_SSH_PORT}...")
+    
+    # Initialize Cloudflare if API token is configured
+    cloudflare = None
+    
+    # Debug: Show what we're checking
+    console.print(f"[dim]Checking CLOUDFLARE_API_TOKEN variable...[/dim]")
+    console.print(f"[dim]Token length: {len(CLOUDFLARE_API_TOKEN)}[/dim]")
+    console.print(f"[dim]Token type: {type(CLOUDFLARE_API_TOKEN)}[/dim]")
+    
+    # Check if API token is set
+    if not CLOUDFLARE_API_TOKEN or CLOUDFLARE_API_TOKEN.strip() == "":
+        console.print("[yellow]⚠ Cloudflare not configured[/yellow]")
+        console.print("[dim]To configure, either:[/dim]")
+        console.print("[dim]  1. Run: ./setup-env.sh[/dim]")
+        console.print("[dim]  2. Or edit CLOUDFLARE_API_TOKEN at line ~44[/dim]")
+        console.print(f"[dim]Current value: '{CLOUDFLARE_API_TOKEN}'[/dim]")
+    else:
+        token_preview = f"{CLOUDFLARE_API_TOKEN[:8]}...{CLOUDFLARE_API_TOKEN[-4:]}"
+        console.print(f"[green]✓ Cloudflare token found: {len(CLOUDFLARE_API_TOKEN)} chars[/green]")
+        console.print(f"[dim]Token preview: {token_preview}[/dim]")
+        
+        try:
+            cloudflare = CloudflareManager(CLOUDFLARE_API_TOKEN.strip())
+            console.print("[dim]Verifying credentials with Cloudflare...[/dim]")
+            
+            if cloudflare.verify_credentials():
+                console.print("[green]✓ Cloudflare API connected successfully![/green]")
+            else:
+                console.print("[red]✗ Cloudflare credentials verification failed[/red]")
+                console.print("[yellow]Check your API token has these permissions:[/yellow]")
+                console.print("[yellow]  - Zone:DNS:Edit[/yellow]")
+                console.print("[yellow]  - Zone:Zone:Read[/yellow]")
+                console.print("[yellow]  - Zone:Zone:Edit (for zone creation)[/yellow]")
+                cloudflare = None
+        except Exception as e:
+            console.print(f"[red]✗ Cloudflare initialization failed: {e}[/red]")
+            import traceback
+            console.print(f"[dim]{traceback.format_exc()}[/dim]")
+            cloudflare = None
+    
+    vps = VPSManager(VPS_HOST, VPS_SSH_USERNAME, VPS_SSH_PORT, cloudflare=cloudflare)
     
     if not vps.connect():
         console.print("[red]Failed to connect. Exiting.[/red]")
         sys.exit(1)
     
-    console.print("[green]✓ Connected successfully![/green]")
+    console.print("[green]✓ SSH Connected successfully![/green]")
     time.sleep(1)
     
     try:

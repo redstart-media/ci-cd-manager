@@ -12,15 +12,26 @@ A comprehensive Python-based VPS management tool with a beautiful terminal UI fo
 
 🚀 **Site Provisioning**
 - One-command site setup
+- **Automatic DNS configuration via Cloudflare API**
+- **DNS propagation verification**
 - Automatic NGINX configuration
 - SSL certificate via Let's Encrypt (Certbot)
 - Beautiful "Coming Soon" landing page
 - www subdomain support
 - Proper directory structure creation
 
+🌐 **DNS Management (Cloudflare)**
+- Automatic DNS record creation during provisioning
+- View all DNS records in your zone
+- Manage DNS for specific domains
+- Update records to point to your VPS
+- Toggle Cloudflare proxy (orange cloud on/off)
+- Add/remove www subdomains
+- Delete DNS records
+
 🔧 **Site Management**
 - Take sites offline (park mode with Coming Soon page)
-- Complete site removal (NGINX, SSL, files)
+- Complete site removal (NGINX, SSL, DNS, files)
 - Individual service restarts (NGINX, PM2, PostgreSQL)
 - Restart all services at once
 
@@ -35,6 +46,40 @@ A comprehensive Python-based VPS management tool with a beautiful terminal UI fo
 - Python 3.8 or higher
 - Passwordless SSH access to your VPS
 - VPS must have: NGINX, PM2, PostgreSQL, Certbot installed
+- **(Optional) Cloudflare account** for automated DNS management
+
+## Cloudflare Configuration (Optional but Recommended)
+
+The VPS Manager includes Cloudflare DNS integration for automated DNS record management.
+
+### Quick Setup
+
+1. **Get Cloudflare API Token:**
+   - Cloudflare Dashboard → Profile → API Tokens → Create Token
+   - Use template: "Edit zone DNS"
+   - Add permission: Zone:Zone:Edit (for automatic zone creation)
+   - Create token and copy it
+
+2. **Edit vps-manager.py (lines 31-42):**
+   ```python
+   # Cloudflare API Configuration
+   CLOUDFLARE_API_TOKEN = "your_token_here"  # Paste your token
+   ```
+
+3. **That's it!** No Zone ID needed - zones are auto-detected
+
+**With Cloudflare configured:**
+- ✅ Automatic DNS record creation during provisioning
+- ✅ Automatic zone creation (if domain not in Cloudflare yet)
+- ✅ DNS propagation verification before SSL setup
+- ✅ Interactive DNS management for all your domains
+- ✅ Toggle Cloudflare proxy settings
+
+**Without Cloudflare:**
+- ⚠️ Manual DNS configuration required
+- ⚠️ Must wait for DNS propagation before running provisioning
+
+See [CLOUDFLARE-QUICKSTART.md](CLOUDFLARE-QUICKSTART.md) for detailed setup.
 
 ## Installation
 
@@ -48,12 +93,15 @@ A comprehensive Python-based VPS management tool with a beautiful terminal UI fo
    pip install -r requirements.txt
    ```
 
-3. **Update SSH configuration in vps-manager.py:**
+3. **Configure vps-manager.py (lines 31-42):**
    ```python
-   # Line ~816 - Update these values:
-   HOST = "23.29.114.83"
-   USERNAME = "beinejd"
-   PORT = 22  # Update with your actual SSH port
+   # VPS Server Configuration
+   VPS_HOST = "23.29.114.83"        # Your server IP
+   VPS_SSH_USERNAME = "beinejd"     # Your SSH username
+   VPS_SSH_PORT = 2223              # Your SSH port
+   
+   # Cloudflare API Configuration (optional)
+   CLOUDFLARE_API_TOKEN = ""  # Add your API token (or leave empty to disable)
    ```
 
 4. **Make the script executable:**
@@ -75,35 +123,45 @@ python3 vps-manager.py
 - Displays all sites with their status
 - Press Ctrl+C to return to menu
 
-**2. Provision New Site**
+**2. Provision New Site (with DNS)**
 - Enter domain name (e.g., example.com)
 - Choose whether to enable www subdomain
+- **(If Cloudflare configured)** Automatically creates DNS records
+- Verifies DNS propagation
 - Automatically creates:
   - NGINX configuration
   - SSL certificate (Let's Encrypt)
   - Beautiful Coming Soon page
   - Directory structure at `/home/deployer/apps/{domain}/`
 
-**3. Take Site Offline (Park)**
+**3. Manage DNS Records** *(Requires Cloudflare)*
+- View all DNS records in your zone
+- Manage DNS for specific domains:
+  - Update DNS to point to this server
+  - Add www subdomain
+  - Delete DNS records
+  - Toggle Cloudflare proxy (🟠/⚪)
+
+**4. Take Site Offline (Park)**
 - Select a site from the list
 - Switches site to Coming Soon page
 - Stops PM2 process
 - Keeps SSL certificate active
 
-**4. Remove Site Provisioning**
+**5. Remove Site Provisioning**
 - Complete removal of site
 - Removes NGINX config
 - Removes SSL certificate
 - Optionally removes application files
 - **Use with caution!**
 
-**5. Restart Service**
+**6. Restart Service**
 - Restart individual services:
   - NGINX
   - PM2 (all processes)
   - PostgreSQL
 
-**6. Restart All Services**
+**7. Restart All Services**
 - Restarts NGINX, PM2, and PostgreSQL together
 - Requires confirmation
 
@@ -230,4 +288,3 @@ Proprietary - Top Engineer / Redstart Media, Inc.
 
 **Version:** 1.0.0  
 **Last Updated:** December 2024
-     Project: vps-manager - Initialized
