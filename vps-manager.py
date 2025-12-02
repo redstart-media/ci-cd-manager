@@ -31,7 +31,7 @@ except ImportError:
 class VPSManager:
     """Manages SSH connection and VPS operations"""
     
-    def __init__(self, host: str, username: str, port: int = 2223):
+    def __init__(self, host: str, username: str, port: int = 22):
         self.host = host
         self.username = username
         self.port = port
@@ -102,15 +102,24 @@ class VPSManager:
         pg_out, _, exit_code = self.execute("systemctl is-active postgresql")
         stats['postgresql_running'] = exit_code == 0 and pg_out.strip() == 'active'
         
-        # PM2 status (as deployer user)
-        pm2_out, _, _ = self.execute("pm2 jlist", use_sudo=True, sudo_user="deployer")
+        # PM2 status (as deployer user - need proper environment)
+        pm2_cmd = "sudo -i -u deployer pm2 jlist"
+        pm2_out, pm2_err, _ = self.execute(pm2_cmd)
         try:
             pm2_data = json.loads(pm2_out) if pm2_out.strip() else []
             stats['pm2_processes'] = len(pm2_data)
             stats['pm2_running'] = sum(1 for p in pm2_data if p.get('pm2_env', {}).get('status') == 'online')
-        except:
-            stats['pm2_processes'] = 0
-            stats['pm2_running'] = 0
+        except Exception as e:
+            # Fallback: try with explicit PATH
+            pm2_cmd_fallback = "sudo -i -u deployer bash -l -c 'pm2 jlist'"
+            pm2_out, _, _ = self.execute(pm2_cmd_fallback)
+            try:
+                pm2_data = json.loads(pm2_out) if pm2_out.strip() else []
+                stats['pm2_processes'] = len(pm2_data)
+                stats['pm2_running'] = sum(1 for p in pm2_data if p.get('pm2_env', {}).get('status') == 'online')
+            except:
+                stats['pm2_processes'] = 0
+                stats['pm2_running'] = 0
         
         return stats
     
@@ -145,8 +154,9 @@ class VPSManager:
                 site_info['ssl_days_left'] = None
             
             # Check if PM2 app exists for this domain
-            pm2_out, _, _ = self.execute(f"pm2 show {site_file}", use_sudo=True, sudo_user="deployer")
-            site_info['pm2_running'] = "online" in pm2_out.lower()
+            pm2_check_cmd = f"sudo -i -u deployer pm2 show {site_file}"
+            pm2_out, _, exit_code = self.execute(pm2_check_cmd)
+            site_info['pm2_running'] = exit_code == 0 and "online" in pm2_out.lower()
             
             sites.append(site_info)
         
@@ -536,7 +546,7 @@ server {{
         self.execute("systemctl reload nginx", use_sudo=True)
         
         # Stop PM2 process if running
-        self.execute(f"pm2 stop {domain}", use_sudo=True, sudo_user="deployer")
+        self.execute(f"sudo -i -u deployer pm2 stop {domain}")
         
         self.console.print(f"[green]✓ {domain} is now offline (Coming Soon page active)[/green]")
         return True
@@ -557,7 +567,7 @@ server {{
             
             # Stop PM2 process
             task = progress.add_task("Stopping PM2 process...", total=None)
-            self.execute(f"pm2 delete {domain}", use_sudo=True, sudo_user="deployer")
+            self.execute(f"sudo -i -u deployer pm2 delete {domain}")
             progress.update(task, completed=True)
             
             # Remove NGINX config
@@ -586,7 +596,7 @@ server {{
         self.console.print(f"\n[cyan]Restarting {service}...[/cyan]")
         
         if service == "pm2":
-            _, stderr, exit_code = self.execute("pm2 restart all", use_sudo=True, sudo_user="deployer")
+            _, stderr, exit_code = self.execute("sudo -i -u deployer pm2 restart all")
         elif service == "nginx":
             _, stderr, exit_code = self.execute("systemctl restart nginx", use_sudo=True)
         elif service == "postgresql":
