@@ -46,13 +46,13 @@ except ImportError:
 # ============================================================================
 
 # VPS Server Configuration
-VPS_HOST = os.environ.get('VPS_SRV1_IP', "23.29.114.83")
+VPS_HOST = os.environ.get('VPS_HOST', "23.29.114.83")
 VPS_SSH_USERNAME = "beinejd"  # Update this to your SSH username
-VPS_SSH_PORT = int(os.environ.get('VPS_SRV1_PORT', "22"))
+VPS_SSH_PORT = int(os.environ.get('VPS_PORT', "2223"))
 
 # Cloudflare API Configuration
 # Get your API token from: https://dash.cloudflare.com/profile/api-tokens
-# Required permission: Zone:DNS:Edit + Zone:Zone:Edit (for zone creation)
+# Required permissions: Zone:DNS:Edit + Zone:Zone:Read + Zone:Zone:Edit
 CLOUDFLARE_API_TOKEN = os.environ.get('CLOUDFLARE_API_TOKEN', "")
 
 # AI API Keys (for future features)
@@ -1211,7 +1211,7 @@ def main_menu(vps: VPSManager):
         console.clear()
         
         # Title
-        cf_status = "✓ Connected" if vps.cloudflare and vps.cloudflare.verify_credentials() else "✗ Not configured"
+        cf_status = "✓ Connected" if vps.cloudflare else "✗ Not configured"
         title = Panel(
             f"[bold cyan]VPS Manager[/bold cyan]\n"
             f"Server: {vps.host}:{vps.port}\n"
@@ -1307,7 +1307,7 @@ def main_menu(vps: VPSManager):
             
             Prompt.ask("\n[dim]Press Enter to continue[/dim]")
         
-        elif choice == "4":
+        elif choice == "5":
             # Remove site
             sites = vps.get_sites()
             if not sites:
@@ -1402,7 +1402,7 @@ def main():
                 console.print("[yellow]Check your API token has these permissions:[/yellow]")
                 console.print("[yellow]  - Zone:DNS:Edit[/yellow]")
                 console.print("[yellow]  - Zone:Zone:Read[/yellow]")
-                console.print("[yellow]  - Zone:Zone:Edit (for zone creation)[/yellow]")
+                console.print("[yellow]  - Zone:Zone:Edit[/yellow]")
                 cloudflare = None
         except Exception as e:
             console.print(f"[red]✗ Cloudflare initialization failed: {e}[/red]")
