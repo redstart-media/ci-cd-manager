@@ -1679,6 +1679,238 @@ server {{
         self.console.print(f"[green]Unchanged packages: {same}[/green]")
         return True
     
+    def list_users(self) -> List[Dict]:
+        """List all system users with details"""
+        output, _, _ = self.execute("getent passwd | awk -F: '{print $1\":\"$3\":\"$6\":\"$7}'")
+        
+        users = []
+        for line in output.split('\n'):
+            if not line.strip():
+                continue
+            
+            parts = line.split(':')
+            if len(parts) >= 4:
+                username, uid, home, shell = parts[0], parts[1], parts[2], parts[3]
+                
+                groups_out, _, _ = self.execute(f"id -nG {username} 2>/dev/null")
+                groups = groups_out.strip().split() if groups_out.strip() else []
+                
+                users.append({
+                    'username': username,
+                    'uid': uid,
+                    'home': home,
+                    'shell': shell,
+                    'groups': groups
+                })
+        
+        return users
+    
+    def create_user(self, username: str, shell: str = "/bin/bash", create_home: bool = True, 
+                   add_to_group: Optional[str] = None) -> bool:
+        """Create a new system user"""
+        self.console.print(f"\n[cyan]Creating user: {username}[/cyan]")
+        
+        cmd = f"useradd -s {shell}"
+        if create_home:
+            cmd += " -m"
+        cmd += f" {username}"
+        
+        _, stderr, exit_code = self.execute(cmd, use_sudo=True)
+        
+        if exit_code != 0:
+            self.console.print(f"[red]Failed to create user: {stderr}[/red]")
+            return False
+        
+        self.console.print(f"[green]✓ User {username} created[/green]")
+        
+        if add_to_group:
+            time.sleep(0.3)
+            self.add_user_to_group(username, add_to_group)
+        
+        return True
+    
+    def delete_user(self, username: str, remove_home: bool = False) -> bool:
+        """Delete a system user"""
+        if not Confirm.ask(f"[yellow]Delete user {username}?[/yellow]"):
+            return False
+        
+        self.console.print(f"\n[cyan]Deleting user: {username}[/cyan]")
+        
+        cmd = "userdel"
+        if remove_home:
+            cmd += " -r"
+        cmd += f" {username}"
+        
+        _, stderr, exit_code = self.execute(cmd, use_sudo=True)
+        
+        if exit_code != 0:
+            self.console.print(f"[red]Failed to delete user: {stderr}[/red]")
+            return False
+        
+        self.console.print(f"[green]✓ User {username} deleted[/green]")
+        return True
+    
+    def set_user_password(self, username: str) -> bool:
+        """Set or reset user password interactively"""
+        self.console.print(f"\n[cyan]Resetting password for {username}[/cyan]")
+        password = Prompt.ask("[cyan]Enter new password[/cyan]", password=True)
+        password_confirm = Prompt.ask("[cyan]Confirm password[/cyan]", password=True)
+        
+        if password != password_confirm:
+            self.console.print("[red]Passwords do not match[/red]")
+            return False
+        
+        encoded_password = base64.b64encode(password.encode()).decode()
+        cmd = f"echo '{encoded_password}' | base64 -d | passwd {username}"
+        
+        _, stderr, exit_code = self.execute(cmd, use_sudo=True)
+        
+        if exit_code == 0:
+            self.console.print(f"[green]✓ Password updated for {username}[/green]")
+            return True
+        else:
+            self.console.print(f"[red]Failed to update password: {stderr}[/red]")
+            return False
+    
+    def lock_user(self, username: str) -> bool:
+        """Lock a user account"""
+        self.console.print(f"\n[cyan]Locking user account: {username}[/cyan]")
+        
+        _, stderr, exit_code = self.execute(f"usermod -L {username}", use_sudo=True)
+        
+        if exit_code == 0:
+            self.console.print(f"[green]✓ User {username} locked[/green]")
+            return True
+        else:
+            self.console.print(f"[red]Failed to lock user: {stderr}[/red]")
+            return False
+    
+    def unlock_user(self, username: str) -> bool:
+        """Unlock a user account"""
+        self.console.print(f"\n[cyan]Unlocking user account: {username}[/cyan]")
+        
+        _, stderr, exit_code = self.execute(f"usermod -U {username}", use_sudo=True)
+        
+        if exit_code == 0:
+            self.console.print(f"[green]✓ User {username} unlocked[/green]")
+            return True
+        else:
+            self.console.print(f"[red]Failed to unlock user: {stderr}[/red]")
+            return False
+    
+    def add_user_to_group(self, username: str, group: str) -> bool:
+        """Add user to a group"""
+        self.console.print(f"\n[cyan]Adding {username} to group {group}[/cyan]")
+        
+        _, stderr, exit_code = self.execute(f"usermod -aG {group} {username}", use_sudo=True)
+        
+        if exit_code == 0:
+            self.console.print(f"[green]✓ {username} added to {group}[/green]")
+            return True
+        else:
+            self.console.print(f"[red]Failed to add user to group: {stderr}[/red]")
+            return False
+    
+    def remove_user_from_group(self, username: str, group: str) -> bool:
+        """Remove user from a group"""
+        self.console.print(f"\n[cyan]Removing {username} from group {group}[/cyan]")
+        
+        groups_out, _, _ = self.execute(f"id -nG {username}")
+        current_groups = groups_out.strip().split()
+        
+        if group not in current_groups:
+            self.console.print(f"[yellow]{username} is not in {group}[/yellow]")
+            return False
+        
+        new_groups = [g for g in current_groups if g != group]
+        new_groups_str = ','.join(new_groups)
+        
+        _, stderr, exit_code = self.execute(f"usermod -G {new_groups_str} {username}", use_sudo=True)
+        
+        if exit_code == 0:
+            self.console.print(f"[green]✓ {username} removed from {group}[/green]")
+            return True
+        else:
+            self.console.print(f"[red]Failed to remove user from group: {stderr}[/red]")
+            return False
+    
+    def grant_sudo_access(self, username: str) -> bool:
+        """Grant sudo access to a user"""
+        self.console.print(f"\n[cyan]Granting sudo access to {username}[/cyan]")
+        
+        sudoers_entry = f"{username} ALL=(ALL:ALL) NOPASSWD:ALL"
+        encoded_entry = base64.b64encode(sudoers_entry.encode()).decode()
+        
+        cmd = f"echo '{encoded_entry}' | base64 -d | sudo tee -a /etc/sudoers.d/{username} > /dev/null"
+        
+        _, stderr, exit_code = self.execute(cmd)
+        
+        if exit_code == 0:
+            time.sleep(0.3)
+            self.execute(f"chmod 0440 /etc/sudoers.d/{username}", use_sudo=True)
+            self.console.print(f"[green]✓ Sudo access granted to {username}[/green]")
+            return True
+        else:
+            self.console.print(f"[red]Failed to grant sudo access: {stderr}[/red]")
+            return False
+    
+    def revoke_sudo_access(self, username: str) -> bool:
+        """Revoke sudo access from a user"""
+        if not Confirm.ask(f"[yellow]Revoke sudo access from {username}?[/yellow]"):
+            return False
+        
+        self.console.print(f"\n[cyan]Revoking sudo access from {username}[/cyan]")
+        
+        _, stderr, exit_code = self.execute(f"rm -f /etc/sudoers.d/{username}", use_sudo=True)
+        
+        if exit_code == 0:
+            self.console.print(f"[green]✓ Sudo access revoked from {username}[/green]")
+            return True
+        else:
+            self.console.print(f"[red]Failed to revoke sudo access: {stderr}[/red]")
+            return False
+    
+    def change_user_shell(self, username: str, new_shell: str) -> bool:
+        """Change user's login shell"""
+        self.console.print(f"\n[cyan]Changing shell for {username} to {new_shell}[/cyan]")
+        
+        _, stderr, exit_code = self.execute(f"usermod -s {new_shell} {username}", use_sudo=True)
+        
+        if exit_code == 0:
+            self.console.print(f"[green]✓ Shell changed to {new_shell}[/green]")
+            return True
+        else:
+            self.console.print(f"[red]Failed to change shell: {stderr}[/red]")
+            return False
+    
+    def get_user_info(self, username: str) -> Optional[Dict]:
+        """Get detailed information about a user"""
+        output, _, _ = self.execute(f"getent passwd {username}")
+        
+        if not output.strip():
+            return None
+        
+        parts = output.strip().split(':')
+        if len(parts) < 7:
+            return None
+        
+        groups_out, _, _ = self.execute(f"id -nG {username}")
+        groups = groups_out.strip().split() if groups_out.strip() else []
+        
+        sudo_out, _, _ = self.execute(f"sudo -l -U {username} 2>/dev/null", use_sudo=True)
+        has_sudo = "NOPASSWD" in sudo_out or "ALL" in sudo_out
+        
+        return {
+            'username': parts[0],
+            'uid': int(parts[2]),
+            'gid': int(parts[3]),
+            'comment': parts[4],
+            'home': parts[5],
+            'shell': parts[6],
+            'groups': groups,
+            'has_sudo': has_sudo
+        }
+    
     def view_dns_records(self, domain: str):
         """View DNS records for a domain"""
         if not self.cloudflare:
@@ -1927,12 +2159,13 @@ def main_menu(vps: VPSManager):
         menu.add_row("9", "SSL Certificate Management")
         menu.add_row("10", "Server Admin (Services & Firewall)")
         menu.add_row("11", "Security Audit & Baseline")
+        menu.add_row("12", "User Administration")
         menu.add_row("q", "Quit")
         
         console.print(menu)
         console.print()
         
-        choice = Prompt.ask("[cyan]Select an option[/cyan]", choices=["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "q"])
+        choice = Prompt.ask("[cyan]Select an option[/cyan]", choices=["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "q"])
         
         if choice == "1":
             # Live monitoring
@@ -2274,6 +2507,151 @@ def main_menu(vps: VPSManager):
                 
                 elif security_choice == "b":
                     security_menu_running = False
+        
+        elif choice == "12":
+            # User Administration
+            user_menu_running = True
+            while user_menu_running:
+                console.clear()
+                console.print("\n[cyan bold]User Administration[/cyan bold]\n")
+                
+                user_menu = Table(show_header=False, box=None, padding=(0, 2))
+                user_menu.add_column("Option", style="cyan bold")
+                user_menu.add_column("Description")
+                
+                user_menu.add_row("1", "List All Users")
+                user_menu.add_row("2", "View User Details")
+                user_menu.add_row("3", "Create New User")
+                user_menu.add_row("4", "Delete User")
+                user_menu.add_row("5", "Reset User Password")
+                user_menu.add_row("6", "Lock/Unlock User")
+                user_menu.add_row("7", "Manage User Groups")
+                user_menu.add_row("8", "Manage Sudo Access")
+                user_menu.add_row("9", "Change User Shell")
+                user_menu.add_row("b", "Back to Main Menu")
+                
+                console.print(user_menu)
+                console.print()
+                
+                user_choice = Prompt.ask("[cyan]Select option[/cyan]", choices=["1", "2", "3", "4", "5", "6", "7", "8", "9", "b"])
+                
+                if user_choice == "1":
+                    users = vps.list_users()
+                    console.print("\n[cyan]System Users:[/cyan]\n")
+                    user_table = Table(show_header=True, box=box.SIMPLE)
+                    user_table.add_column("Username", style="cyan")
+                    user_table.add_column("UID", justify="right")
+                    user_table.add_column("Home", style="green")
+                    user_table.add_column("Shell", style="yellow")
+                    user_table.add_column("Groups", style="dim")
+                    
+                    for user in users:
+                        groups_str = ', '.join(user['groups'][:3]) if user['groups'] else "none"
+                        if len(user['groups']) > 3:
+                            groups_str += f" +{len(user['groups'])-3}"
+                        user_table.add_row(user['username'], user['uid'], user['home'], user['shell'], groups_str)
+                    
+                    console.print(user_table)
+                    Prompt.ask("\n[dim]Press Enter to continue[/dim]")
+                
+                elif user_choice == "2":
+                    username = Prompt.ask("[cyan]Enter username[/cyan]")
+                    info = vps.get_user_info(username)
+                    
+                    if info:
+                        console.print(f"\n[cyan]User: {info['username']}[/cyan]")
+                        console.print(f"  UID: {info['uid']}")
+                        console.print(f"  GID: {info['gid']}")
+                        console.print(f"  Comment: {info['comment']}")
+                        console.print(f"  Home: {info['home']}")
+                        console.print(f"  Shell: {info['shell']}")
+                        console.print(f"  Groups: {', '.join(info['groups'])}")
+                        console.print(f"  Sudo Access: {'[green]Yes[/green]' if info['has_sudo'] else '[red]No[/red]'}")
+                    else:
+                        console.print(f"[red]User {username} not found[/red]")
+                    
+                    Prompt.ask("\n[dim]Press Enter to continue[/dim]")
+                
+                elif user_choice == "3":
+                    username = Prompt.ask("[cyan]Enter new username[/cyan]")
+                    shell = Prompt.ask("[cyan]Select shell[/cyan]", choices=["bash", "sh", "zsh"], default="bash")
+                    shell_path = f"/bin/{shell}"
+                    create_home = Confirm.ask("Create home directory?", default=True)
+                    add_group = Prompt.ask("[cyan]Add to group (optional, press Enter to skip)[/cyan]", default="")
+                    
+                    vps.create_user(username, shell=shell_path, create_home=create_home, 
+                                  add_to_group=add_group if add_group else None)
+                    Prompt.ask("\n[dim]Press Enter to continue[/dim]")
+                
+                elif user_choice == "4":
+                    username = Prompt.ask("[cyan]Enter username to delete[/cyan]")
+                    remove_home = Confirm.ask("Remove home directory?", default=False)
+                    vps.delete_user(username, remove_home=remove_home)
+                    Prompt.ask("\n[dim]Press Enter to continue[/dim]")
+                
+                elif user_choice == "5":
+                    username = Prompt.ask("[cyan]Enter username[/cyan]")
+                    vps.set_user_password(username)
+                    Prompt.ask("\n[dim]Press Enter to continue[/dim]")
+                
+                elif user_choice == "6":
+                    username = Prompt.ask("[cyan]Enter username[/cyan]")
+                    console.print("\n[cyan]Options:[/cyan]")
+                    console.print("  1. Lock account")
+                    console.print("  2. Unlock account")
+                    lock_choice = Prompt.ask("\nSelect option", choices=["1", "2"])
+                    
+                    if lock_choice == "1":
+                        vps.lock_user(username)
+                    else:
+                        vps.unlock_user(username)
+                    
+                    Prompt.ask("\n[dim]Press Enter to continue[/dim]")
+                
+                elif user_choice == "7":
+                    username = Prompt.ask("[cyan]Enter username[/cyan]")
+                    console.print("\n[cyan]Group Management Options:[/cyan]")
+                    console.print("  1. Add to group")
+                    console.print("  2. Remove from group")
+                    group_choice = Prompt.ask("\nSelect option", choices=["1", "2"])
+                    
+                    group = Prompt.ask("[cyan]Enter group name[/cyan]")
+                    
+                    if group_choice == "1":
+                        vps.add_user_to_group(username, group)
+                    else:
+                        vps.remove_user_from_group(username, group)
+                    
+                    Prompt.ask("\n[dim]Press Enter to continue[/dim]")
+                
+                elif user_choice == "8":
+                    username = Prompt.ask("[cyan]Enter username[/cyan]")
+                    console.print("\n[cyan]Sudo Access Options:[/cyan]")
+                    console.print("  1. Grant sudo access")
+                    console.print("  2. Revoke sudo access")
+                    sudo_choice = Prompt.ask("\nSelect option", choices=["1", "2"])
+                    
+                    if sudo_choice == "1":
+                        vps.grant_sudo_access(username)
+                    else:
+                        vps.revoke_sudo_access(username)
+                    
+                    Prompt.ask("\n[dim]Press Enter to continue[/dim]")
+                
+                elif user_choice == "9":
+                    username = Prompt.ask("[cyan]Enter username[/cyan]")
+                    new_shell = Prompt.ask("[cyan]Select new shell[/cyan]", choices=["bash", "sh", "zsh", "nologin"], default="bash")
+                    
+                    if new_shell == "nologin":
+                        shell_path = "/usr/sbin/nologin"
+                    else:
+                        shell_path = f"/bin/{new_shell}"
+                    
+                    vps.change_user_shell(username, shell_path)
+                    Prompt.ask("\n[dim]Press Enter to continue[/dim]")
+                
+                elif user_choice == "b":
+                    user_menu_running = False
         
         elif choice == "q":
             console.print("\n[cyan]Disconnecting...[/cyan]")
