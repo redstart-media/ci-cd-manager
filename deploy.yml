@@ -1,0 +1,82 @@
+name: Deploy Next.js to topengineer.us
+
+on:
+  push:
+    branches:
+      - production
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      
+      # 1. CLEAN FIRST: Remove any existing build outputs and node_modules
+      - name: Clean workspace
+        run: |
+          rm -rf .next node_modules
+      
+      # 2. INSTALL ONCE: Install all dependencies (including dev) from lockfile
+      - name: Install dependencies
+        run: npm ci
+        env:
+          NODE_ENV: development
+      
+      # 3. BUILD: Run the production build
+      - name: Build Next.js application
+        run: npm run build
+        env:
+          NODE_ENV: production
+      
+      # 4. PACKAGE: Create deployment artifact
+      - name: Create deployment package
+        run: |
+          mkdir -p deploy
+          cp -r .next deploy/
+          cp -r public deploy/
+          cp -r node_modules deploy/
+          cp -r scripts deploy/
+          cp package.json deploy/
+          cp ecosystem.config.js deploy/
+          tar -czf deploy.tar.gz -C deploy .
+      
+      - name: Deploy to VPS
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT }}
+          source: "deploy.tar.gz"
+          target: "/home/deployer/temp"
+      
+      - name: Extract and restart application
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT }}
+          script: |
+            export NVM_DIR="$HOME/.nvm"
+            [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+            
+            cd /home/deployer/apps/topengineer.us
+            rm -rf .next public scripts node_modules
+            tar -xzf /home/deployer/temp/deploy.tar.gz --strip-components=1
+            rm -f /home/deployer/temp/deploy.tar.gz
+            pm2 stop topengineer 2>/dev/null || true
+            pm2 start ecosystem.config.js --env production
+            pm2 save
+      
+      - name: Deployment complete
+        run: echo "🚀 Deployment to topengineer.us completed successfully!"
