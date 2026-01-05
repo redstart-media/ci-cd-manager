@@ -1,0 +1,63 @@
+{
+  "projects": {
+    "topengineer": {
+      "github": {
+        "owner": "redstart-media",
+        "repo": "topengineer.us"
+      },
+      "vps": {
+        "app_name": "topengineer",
+        "app_path": "/home/deployer/apps/topengineer.us",
+        "port": 3000
+      },
+      "secrets": {
+        "VPS_HOST": "23.29.114.83",
+        "VPS_USER": "beinejd",
+        "VPS_SSH_KEY": "VPS_SSH_KEY",
+        "VPS_PORT": "2223",
+        "VPS_APP_PATH": "/home/deployer/apps/topengineer.us",
+        "DATABASE_URL": "postgresql://...",
+        "API_KEY": "your-api-key"
+      },
+      "environments": {
+        "production": {
+          "branch": "main",
+          "vps_host": "23.29.114.83",
+          "deployment_script": "deploy.sh"
+        },
+        "staging": {
+          "branch": "develop",
+          "vps_host": "23.29.114.83",
+          "deployment_script": "deploy-staging.sh"
+        }
+      },
+      "created_at": "2026-01-05T04:21:00"
+    },
+    "new-repo": {
+      "github": {
+        "owner": "redstart-media",
+        "repo": "new-repo"
+      },
+      "vps": {
+        "app_name": "new-repo",
+        "app_path": "/home/deployer/apps/new-repo",
+        "port": 3001
+      },
+      "secrets": {
+        "VPS_HOST": "23.29.114.83",
+        "VPS_USER": "beinejd",
+        "VPS_SSH_KEY": "VPS_SSH_KEY",
+        "VPS_PORT": "2223",
+        "VPS_APP_PATH": "/home/deployer/apps/new-repo"
+      },
+      "environments": {
+        "production": {
+          "branch": "main",
+          "vps_host": "23.29.114.83",
+          "deployment_script": "deploy.sh"
+        }
+      },
+      "created_at": "2026-01-05T04:21:00"
+    }
+  }
+}

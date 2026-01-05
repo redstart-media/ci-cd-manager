@@ -1,4 +1,0 @@
-curl "https://api.cloudflare.com/client/v4/accounts/d6edbc5a03efc4ff01879ff04e4d7177/tokens/verify" \
--H "Authorization: Bearer UuEpvUlWQ2crhCDHe3itKFHyybiHCARcKstGnc5o"
-
-UuEpvUlWQ2crhCDHe3itKFHyybiHCARcKstGnc5o
