@@ -573,11 +573,11 @@ class PipelineDashboard:
             existing_names = {s['name'].upper() for s in secrets}
             
             required_secrets = {
-                'DEPLOY_SSH_KEY',
-                'DEPLOY_HOST',
-                'DEPLOY_USER',
-                'DEPLOY_PORT',
-                'DEPLOY_PATH'
+                'VPS_SSH_KEY',
+                'VPS_HOST',
+                'VPS_USER',
+                'VPS_PORT',
+                'VPS_DEPLOY_PATH'
             }
             
             return required_secrets.issubset(existing_names)
@@ -1202,18 +1202,18 @@ class CICDManagerCLI:
         for idx, app_name in enumerate(app_list, 1):
             app_info = deployed_apps[app_name]
             
-            repo_status = "✓" if app_info.get('github_repo') else "✗"
-            workflow_status = "✓" if app_info.get('has_workflow') else "✗"
+            repo_status = "🟢" if app_info.get('github_repo') else "🔴"
+            workflow_status = "🟢" if app_info.get('has_workflow') else "🔴"
             
-            secrets_status = "?"
+            secrets_status = "🟡"
             if app_info.get('github_repo'):
                 parts = app_info['github_repo'].split('/')
                 if len(parts) == 2:
                     owner, repo = parts
                     if self._check_deploy_secrets(owner, repo):
-                        secrets_status = "✓"
+                        secrets_status = "🟢"
                     else:
-                        secrets_status = "✗"
+                        secrets_status = "🔴"
             
             apps_table.add_row(
                 str(idx),
@@ -1224,7 +1224,7 @@ class CICDManagerCLI:
             )
         
         self.console.print(apps_table)
-        self.console.print("\n[dim]✓ = Configured/Present | ✗ = Missing | ? = N/A[/dim]")
+        self.console.print("\n[dim]🟢 = Configured/Present | 🔴 = Missing | 🟡 = N/A[/dim]")
         
         while True:
             try:
@@ -1271,13 +1271,13 @@ class CICDManagerCLI:
                     owner, repo = parts
                     
                     self.console.print(f"[green]Repository:[/green] {github_repo}")
-                    self.console.print(f"[green]Workflow:[/green] {'✓ Found' if app_info.get('has_workflow') else '✗ Not found'}")
+                    self.console.print(f"[green]Workflow:[/green] {'🟢 Found' if app_info.get('has_workflow') else '🔴 Not found'}")
                     
                     secrets = self.secrets_manager.list_secrets(owner, repo) if self._can_access_repo(owner, repo) else []
                     secrets_count = len(secrets) if secrets else 0
                     self.console.print(f"[green]Secrets Configured:[/green] {secrets_count}\n")
                     
-                    required_secrets = {'DEPLOY_SSH_KEY', 'DEPLOY_HOST', 'DEPLOY_USER', 'DEPLOY_PORT', 'DEPLOY_PATH'}
+                    required_secrets = {'VPS_SSH_KEY', 'VPS_HOST', 'VPS_USER', 'VPS_PORT', 'VPS_DEPLOY_PATH'}
                     existing_names = {s['name'].upper() for s in secrets} if secrets else set()
                     missing_secrets = required_secrets - existing_names
                     
@@ -1287,22 +1287,21 @@ class CICDManagerCLI:
                         self.console.print("[2] List secrets")
                         self.console.print("[0] Back to sites list")
                     else:
-                        self.console.print("[green]✓ All required secrets installed[/green]\n")
+                        self.console.print("[green]🟢 All required secrets installed[/green]\n")
                         self.console.print("[1] List secrets")
-                        self.console.print("[2] Update secret")
-                        self.console.print("[3] Delete secret")
+                        self.console.print("[2] Overwrite/Reinstall secrets")
                         self.console.print("[0] Back to sites list")
                     
                     choice = Prompt.ask("\nSelect option")
                     
                     if missing_secrets and choice == "1":
-                        result = self._auto_install_secrets_for_repo(owner, repo, [app_name], [app_info.get('path')])
+                        result = self._auto_install_secrets_for_repo(owner, repo, [app_name], [app_info.get('path')], overwrite=False)
                         self.console.clear()
                         if result['success']:
-                            self.console.print(f"[green]✓ Secrets installed successfully[/green]")
+                            self.console.print(f"[green]🟢 Secrets installed successfully[/green]")
                             self.console.print(result['message'])
                         else:
-                            self.console.print(f"[red]✗ Failed to install secrets[/red]")
+                            self.console.print(f"[red]🔴 Failed to install secrets[/red]")
                             self.console.print(result['message'])
                         Prompt.ask("\nPress Enter to continue")
                     elif choice == "1" and not missing_secrets:
@@ -1311,9 +1310,16 @@ class CICDManagerCLI:
                         if missing_secrets:
                             self._list_repo_secrets(owner, repo)
                         else:
-                            self._create_update_secret(owner, repo)
-                    elif choice == "3" and not missing_secrets:
-                        self._delete_secret(owner, repo)
+                            if Confirm.ask("Overwrite all secrets with current values?"):
+                                result = self._auto_install_secrets_for_repo(owner, repo, [app_name], [app_info.get('path')], overwrite=True)
+                                self.console.clear()
+                                if result['success']:
+                                    self.console.print(f"[green]🟢 Secrets overwritten successfully[/green]")
+                                    self.console.print(result['message'])
+                                else:
+                                    self.console.print(f"[red]🔴 Failed to overwrite secrets[/red]")
+                                    self.console.print(result['message'])
+                                Prompt.ask("\nPress Enter to continue")
                     elif choice == "0":
                         break
                     else:
@@ -1334,11 +1340,11 @@ class CICDManagerCLI:
             existing_names = {s['name'].upper() for s in secrets}
             
             required_secrets = {
-                'DEPLOY_SSH_KEY',
-                'DEPLOY_HOST',
-                'DEPLOY_USER',
-                'DEPLOY_PORT',
-                'DEPLOY_PATH'
+                'VPS_SSH_KEY',
+                'VPS_HOST',
+                'VPS_USER',
+                'VPS_PORT',
+                'VPS_DEPLOY_PATH'
             }
             
             return required_secrets.issubset(existing_names)
@@ -1352,30 +1358,6 @@ class CICDManagerCLI:
             return True
         except Exception:
             return False
-    
-    def _manage_single_repo_secrets(self, owner: str, repo: str):
-        """Manage secrets for a single repository"""
-        while True:
-            self.console.clear()
-            self.console.print(f"[bold]Secrets for {owner}/{repo}[/bold]\n")
-            self.console.print("[1] List secrets")
-            self.console.print("[2] Create/Update secret")
-            self.console.print("[3] Delete secret")
-            self.console.print("[0] Back")
-            
-            choice = Prompt.ask("\nSelect option")
-            
-            if choice == "1":
-                self._list_repo_secrets(owner, repo)
-            elif choice == "2":
-                self._create_update_secret(owner, repo)
-            elif choice == "3":
-                self._delete_secret(owner, repo)
-            elif choice == "0":
-                break
-            else:
-                self.console.print("[red]Invalid option[/red]")
-                time.sleep(1)
     
     def _list_repo_secrets(self, owner: str, repo: str):
         """List all secrets in a repository"""
@@ -1393,48 +1375,6 @@ class CICDManagerCLI:
             self.console.print(table)
         else:
             self.console.print("[yellow]No secrets found in this repository[/yellow]")
-        
-        Prompt.ask("\nPress Enter to continue")
-    
-    def _create_update_secret(self, owner: str, repo: str):
-        """Create or update a secret"""
-        self.console.clear()
-        secret_name = Prompt.ask("Secret name")
-        secret_value = Prompt.ask("Secret value", password=True)
-        
-        if self.secrets_manager.create_secret(owner, repo, secret_name, secret_value):
-            self.console.print("[green]✓ Secret created/updated successfully[/green]")
-        else:
-            self.console.print("[red]✗ Failed to create/update secret[/red]")
-        
-        Prompt.ask("\nPress Enter to continue")
-    
-    def _delete_secret(self, owner: str, repo: str):
-        """Delete a secret"""
-        self.console.clear()
-        secrets = self.secrets_manager.list_secrets(owner, repo)
-        
-        if not secrets:
-            self.console.print("[yellow]No secrets found to delete[/yellow]")
-            Prompt.ask("\nPress Enter to continue")
-            return
-        
-        table = Table(title="Available secrets to delete")
-        table.add_column("Index", style="cyan")
-        table.add_column("Name", style="green")
-        
-        for idx, secret in enumerate(secrets, 1):
-            table.add_row(str(idx), secret['name'])
-        
-        self.console.print(table)
-        
-        secret_name = Prompt.ask("\nSecret name to delete")
-        
-        if Confirm.ask(f"Delete '{secret_name}'?"):
-            if self.secrets_manager.delete_secret(owner, repo, secret_name):
-                self.console.print("[green]✓ Secret deleted successfully[/green]")
-            else:
-                self.console.print("[red]✗ Failed to delete secret[/red]")
         
         Prompt.ask("\nPress Enter to continue")
     
@@ -1499,7 +1439,7 @@ class CICDManagerCLI:
             apps_str = ", ".join(app_names)
             
             result = self._auto_install_secrets_for_repo(owner, repo, app_names, app_paths)
-            status = "[green]✓ Success[/green]" if result['success'] else "[red]✗ Failed[/red]"
+            status = "[green]🟢 Success[/green]" if result['success'] else "[red]🔴 Failed[/red]"
             
             table.add_row(repo_key, apps_str, status)
             installation_results.append(result)
@@ -1521,20 +1461,20 @@ class CICDManagerCLI:
         
         Prompt.ask("\nPress Enter to continue")
     
-    def _auto_install_secrets_for_repo(self, owner: str, repo: str, app_names: list, app_paths: list) -> Dict:
+    def _auto_install_secrets_for_repo(self, owner: str, repo: str, app_names: list, app_paths: list, overwrite: bool = False) -> Dict:
         """Automatically install all deploy secrets for a repository"""
         repo_key = f"{owner}/{repo}"
         
         try:
             secrets_values = {}
             
-            secrets_values['DEPLOY_SSH_KEY'] = self._get_ssh_key_value()
-            secrets_values['DEPLOY_HOST'] = VPS_HOST
-            secrets_values['DEPLOY_USER'] = VPS_SSH_USERNAME
-            secrets_values['DEPLOY_PORT'] = str(VPS_SSH_PORT)
+            secrets_values['VPS_SSH_KEY'] = self._get_ssh_key_value()
+            secrets_values['VPS_HOST'] = VPS_HOST
+            secrets_values['VPS_USER'] = 'deployer'
+            secrets_values['VPS_PORT'] = str(VPS_SSH_PORT)
             
             if app_paths and app_paths[0]:
-                secrets_values['DEPLOY_PATH'] = app_paths[0]
+                secrets_values['VPS_DEPLOY_PATH'] = app_paths[0]
             else:
                 return {
                     'success': False,
@@ -1543,19 +1483,37 @@ class CICDManagerCLI:
                 }
             
             existing_secrets = self.secrets_manager.list_secrets(owner, repo)
-            existing_names = {s['name'].upper() for s in existing_secrets}
             
-            secrets_to_install = [
-                (name, value) for name, value in secrets_values.items()
-                if name not in existing_names
-            ]
+            if overwrite or not existing_secrets:
+                for secret in existing_secrets:
+                    self.secrets_manager.delete_secret(owner, repo, secret['name'])
+                secrets_to_install = [(name, value) for name, value in secrets_values.items()]
+            else:
+                existing_names = {s['name'] for s in existing_secrets}
+                secrets_to_install = [
+                    (name, value) for name, value in secrets_values.items()
+                    if name not in existing_names
+                ]
             
-            if not secrets_to_install:
+            if not secrets_to_install and existing_secrets:
                 return {
                     'success': True,
                     'repo_key': repo_key,
                     'message': 'All secrets already installed'
                 }
+            
+            self.console.print(f"\n[bold cyan]Repository: {owner}/{repo}[/bold cyan]")
+            self.console.print("[bold]Secrets to install:[/bold]")
+            for secret_name, secret_value in secrets_to_install:
+                if secret_name == 'VPS_SSH_KEY':
+                    key_lines = secret_value.split('\n')
+                    self.console.print(f"  • {secret_name}: [green]Deployer's SSH private key ({len(key_lines)} lines)[/green]")
+                elif secret_name == 'VPS_USER':
+                    self.console.print(f"  • {secret_name}: [cyan]{secret_value}[/cyan] [dim](deployer account)[/dim]")
+                elif secret_name == 'VPS_DEPLOY_PATH':
+                    self.console.print(f"  • {secret_name}: [cyan]{secret_value}[/cyan]")
+                else:
+                    self.console.print(f"  • {secret_name}: [cyan]{secret_value}[/cyan]")
             
             installed_count = 0
             failed_count = 0
@@ -1567,10 +1525,11 @@ class CICDManagerCLI:
                     failed_count += 1
             
             if failed_count == 0:
+                action = "Overwritten" if overwrite else "Installed"
                 return {
                     'success': True,
                     'repo_key': repo_key,
-                    'message': f'Installed {installed_count} secret(s)'
+                    'message': f'{action} {installed_count} secret(s)'
                 }
             else:
                 return {
@@ -1587,16 +1546,23 @@ class CICDManagerCLI:
             }
     
     def _get_ssh_key_value(self) -> str:
-        """Get SSH key value from configured path"""
+        """Get deployer's SSH key from VPS"""
         try:
-            key_path = Path(VPS_SSH_KEY)
-            if key_path.exists():
-                with open(key_path, 'r') as f:
-                    return f.read()
-            else:
-                raise FileNotFoundError(f"SSH key not found at {VPS_SSH_KEY}")
+            if not self.server_discovery.connect():
+                raise Exception("Failed to connect to VPS to retrieve deployer SSH key")
+            
+            stdout, stderr, code = self.server_discovery.execute("sudo cat /home/deployer/.ssh/id_ed25519 || sudo cat /home/deployer/.ssh/id_rsa", use_sudo=True)
+            self.server_discovery.disconnect()
+            
+            if code != 0:
+                raise Exception(f"Failed to read deployer SSH key from VPS: {stderr}")
+            
+            if not stdout:
+                raise Exception("SSH key is empty or not found on VPS at /home/deployer/.ssh/")
+            
+            return stdout
         except Exception as e:
-            self.console.print(f"[red]Error reading SSH key: {e}[/red]")
+            self.console.print(f"[red]Error reading deployer SSH key from VPS: {e}[/red]")
             raise
     
 
