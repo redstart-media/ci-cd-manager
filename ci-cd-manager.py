@@ -152,10 +152,9 @@ class GitHubSecretsManager:
         """Encrypt secret value using repository public key"""
         try:
             public_key = nacl.public.PublicKey(public_key_str, encoder=nacl.encoding.Base64Encoder)
-            encrypted = nacl.public.Box(nacl.public.PrivateKey.generate()).encrypt(
-                secret_value.encode(), public_key
-            )
-            return base64.b64encode(encrypted.ciphertext).decode()
+            sealed_box = nacl.public.SealedBox(public_key)
+            encrypted = sealed_box.encrypt(secret_value.encode())
+            return base64.b64encode(encrypted).decode()
         except Exception as e:
             self.console.print(f"[red]Error encrypting secret: {e}[/red]")
             return ""
@@ -1175,7 +1174,7 @@ class CICDManagerCLI:
                 time.sleep(1)
     
     def _manage_secrets_from_deployed_apps(self):
-        """Manage secrets by discovering deployed apps and their repos"""
+        """Manage secrets by discovering all deployed apps and their configuration status"""
         self.console.clear()
         self.console.print("[cyan]Discovering deployed applications...[/cyan]\n")
         
@@ -1192,58 +1191,167 @@ class CICDManagerCLI:
             Prompt.ask("\nPress Enter to continue")
             return
         
-        repos = {}
-        for app_name, app_info in deployed_apps.items():
-            github_repo = app_info.get('github_repo')
-            if github_repo:
-                parts = github_repo.split('/')
+        app_list = sorted(deployed_apps.keys())
+        apps_table = Table(title=f"Configured Sites ({len(app_list)})")
+        apps_table.add_column("Index", style="cyan")
+        apps_table.add_column("Site", style="cyan", width=20)
+        apps_table.add_column("Git Repo", justify="center", width=10)
+        apps_table.add_column("Workflow", justify="center", width=10)
+        apps_table.add_column("Secrets", justify="center", width=10)
+        
+        for idx, app_name in enumerate(app_list, 1):
+            app_info = deployed_apps[app_name]
+            
+            repo_status = "✓" if app_info.get('github_repo') else "✗"
+            workflow_status = "✓" if app_info.get('has_workflow') else "✗"
+            
+            secrets_status = "?"
+            if app_info.get('github_repo'):
+                parts = app_info['github_repo'].split('/')
                 if len(parts) == 2:
                     owner, repo = parts
-                    repo_key = f"{owner}/{repo}"
-                    if repo_key not in repos:
-                        repos[repo_key] = {
-                            'owner': owner,
-                            'repo': repo,
-                            'apps': []
-                        }
-                    repos[repo_key]['apps'].append(app_name)
+                    if self._check_deploy_secrets(owner, repo):
+                        secrets_status = "✓"
+                    else:
+                        secrets_status = "✗"
+            
+            apps_table.add_row(
+                str(idx),
+                app_name,
+                repo_status,
+                workflow_status,
+                secrets_status
+            )
         
-        if not repos:
-            self.console.print("[yellow]No GitHub repositories configured in deployed apps[/yellow]")
-            Prompt.ask("\nPress Enter to continue")
-            return
-        
-        repo_list = sorted(repos.keys())
-        repo_table = Table(title=f"Discovered Repositories ({len(repo_list)})")
-        repo_table.add_column("Index", style="cyan")
-        repo_table.add_column("Repository", style="green")
-        repo_table.add_column("Deployed Apps", style="yellow")
-        
-        for idx, repo_key in enumerate(repo_list, 1):
-            apps_str = ", ".join(repos[repo_key]['apps'])
-            repo_table.add_row(str(idx), repo_key, apps_str)
-        
-        self.console.print(repo_table)
+        self.console.print(apps_table)
+        self.console.print("\n[dim]✓ = Configured/Present | ✗ = Missing | ? = N/A[/dim]")
         
         while True:
             try:
-                choice = Prompt.ask("\nSelect repository (number) or [0] to go back")
+                choice = Prompt.ask("\nSelect site (number) or [0] to go back")
                 choice_idx = int(choice)
                 
                 if choice_idx == 0:
                     break
                 
-                if 1 <= choice_idx <= len(repo_list):
-                    repo_key = repo_list[choice_idx - 1]
-                    owner = repos[repo_key]['owner']
-                    repo = repos[repo_key]['repo']
+                if 1 <= choice_idx <= len(app_list):
+                    app_name = app_list[choice_idx - 1]
+                    app_info = deployed_apps[app_name]
                     
-                    self._manage_single_repo_secrets(owner, repo)
-                    break
+                    self._manage_site_secrets(app_name, app_info)
                 else:
                     self.console.print("[red]Invalid selection[/red]")
             except ValueError:
                 self.console.print("[red]Please enter a valid number[/red]")
+    
+    def _manage_site_secrets(self, app_name: str, app_info: Dict):
+        """Manage secrets for a deployed site"""
+        while True:
+            self.console.clear()
+            self.console.print(f"[bold]Secrets Management - {app_name}[/bold]\n")
+            
+            github_repo = app_info.get('github_repo')
+            
+            if not github_repo:
+                self.console.print("[yellow]⚠ This site does not have a GitHub repository configured[/yellow]")
+                self.console.print("[cyan]To configure CI/CD secrets, the site must have:[/cyan]")
+                self.console.print("  1. A .git directory with GitHub remote URL")
+                self.console.print("  2. A deploy workflow in .github/workflows/")
+                self.console.print("\n[0] Back to sites list")
+                
+                choice = Prompt.ask("\nSelect option")
+                if choice == "0":
+                    break
+                else:
+                    self.console.print("[red]Invalid option[/red]")
+                    time.sleep(1)
+            else:
+                parts = github_repo.split('/')
+                if len(parts) == 2:
+                    owner, repo = parts
+                    
+                    self.console.print(f"[green]Repository:[/green] {github_repo}")
+                    self.console.print(f"[green]Workflow:[/green] {'✓ Found' if app_info.get('has_workflow') else '✗ Not found'}")
+                    
+                    secrets = self.secrets_manager.list_secrets(owner, repo) if self._can_access_repo(owner, repo) else []
+                    secrets_count = len(secrets) if secrets else 0
+                    self.console.print(f"[green]Secrets Configured:[/green] {secrets_count}\n")
+                    
+                    required_secrets = {'DEPLOY_SSH_KEY', 'DEPLOY_HOST', 'DEPLOY_USER', 'DEPLOY_PORT', 'DEPLOY_PATH'}
+                    existing_names = {s['name'].upper() for s in secrets} if secrets else set()
+                    missing_secrets = required_secrets - existing_names
+                    
+                    if missing_secrets:
+                        self.console.print(f"[yellow]Missing {len(missing_secrets)} secret(s): {', '.join(sorted(missing_secrets))}[/yellow]\n")
+                        self.console.print("[1] Auto-install all required secrets")
+                        self.console.print("[2] List secrets")
+                        self.console.print("[0] Back to sites list")
+                    else:
+                        self.console.print("[green]✓ All required secrets installed[/green]\n")
+                        self.console.print("[1] List secrets")
+                        self.console.print("[2] Update secret")
+                        self.console.print("[3] Delete secret")
+                        self.console.print("[0] Back to sites list")
+                    
+                    choice = Prompt.ask("\nSelect option")
+                    
+                    if missing_secrets and choice == "1":
+                        result = self._auto_install_secrets_for_repo(owner, repo, [app_name], [app_info.get('path')])
+                        self.console.clear()
+                        if result['success']:
+                            self.console.print(f"[green]✓ Secrets installed successfully[/green]")
+                            self.console.print(result['message'])
+                        else:
+                            self.console.print(f"[red]✗ Failed to install secrets[/red]")
+                            self.console.print(result['message'])
+                        Prompt.ask("\nPress Enter to continue")
+                    elif choice == "1" and not missing_secrets:
+                        self._list_repo_secrets(owner, repo)
+                    elif choice == "2":
+                        if missing_secrets:
+                            self._list_repo_secrets(owner, repo)
+                        else:
+                            self._create_update_secret(owner, repo)
+                    elif choice == "3" and not missing_secrets:
+                        self._delete_secret(owner, repo)
+                    elif choice == "0":
+                        break
+                    else:
+                        self.console.print("[red]Invalid option[/red]")
+                        time.sleep(1)
+                else:
+                    self.console.print("[red]Invalid repository format[/red]")
+                    Prompt.ask("\nPress Enter to continue")
+                    break
+    
+    def _check_deploy_secrets(self, owner: str, repo: str) -> bool:
+        """Check if all required deploy secrets are configured in GitHub"""
+        try:
+            secrets = self.secrets_manager.list_secrets(owner, repo)
+            if not secrets:
+                return False
+            
+            existing_names = {s['name'].upper() for s in secrets}
+            
+            required_secrets = {
+                'DEPLOY_SSH_KEY',
+                'DEPLOY_HOST',
+                'DEPLOY_USER',
+                'DEPLOY_PORT',
+                'DEPLOY_PATH'
+            }
+            
+            return required_secrets.issubset(existing_names)
+        except Exception:
+            return False
+    
+    def _can_access_repo(self, owner: str, repo: str) -> bool:
+        """Check if we can access the repository"""
+        try:
+            self.secrets_manager.list_secrets(owner, repo)
+            return True
+        except Exception:
+            return False
     
     def _manage_single_repo_secrets(self, owner: str, repo: str):
         """Manage secrets for a single repository"""
@@ -1331,237 +1439,165 @@ class CICDManagerCLI:
         Prompt.ask("\nPress Enter to continue")
     
     def _install_deploy_secrets(self):
-        """Install deploy secrets needed for GitHub Actions CI/CD - show all deployed apps"""
+        """Automatically install all deploy secrets for all apps with GitHub repos"""
         self.console.clear()
         self.console.print("[cyan]Discovering deployed applications...[/cyan]\n")
         
-        # Match live dashboard pattern: connect first, discover apps, then detect pipelines
-        if not self.server_discovery.ssh_client:
-            self.server_discovery.connect()
+        if not self.server_discovery.connect():
+            self.console.print("[red]Failed to connect to VPS[/red]")
+            Prompt.ask("\nPress Enter to continue")
+            return
         
         all_deployed_apps = self.server_discovery.discover_deployed_apps(verbose=False)
+        self.server_discovery.disconnect()
         
         if not all_deployed_apps:
             self.console.print("[yellow]No deployed applications found[/yellow]")
             Prompt.ask("\nPress Enter to continue")
             return
         
-        # Display table with ALL deployed apps (same as live dashboard shows)
-        app_table = Table(title=f"All Deployed Applications ({len(all_deployed_apps)})")
-        app_table.add_column("Index", style="cyan")
-        app_table.add_column("App", style="yellow")
-        app_table.add_column("GitHub Remote", style="green")
-        app_table.add_column("Secrets", style="magenta")
-        
-        app_list = sorted(all_deployed_apps.keys())
-        installable_repos = {}  # Track repos we can install secrets for
-        
-        for idx, app_name in enumerate(app_list, 1):
-            app_info = all_deployed_apps[app_name]
+        installable_repos = {}
+        for app_name, app_info in all_deployed_apps.items():
             github_repo = app_info.get('github_repo')
-            
             if github_repo:
-                repo_status = github_repo
                 parts = github_repo.split('/')
                 if len(parts) == 2:
                     owner, repo = parts
                     repo_key = f"{owner}/{repo}"
                     
-                    # Track for selection
                     if repo_key not in installable_repos:
                         installable_repos[repo_key] = {
                             'owner': owner,
                             'repo': repo,
-                            'apps': [],
-                            'paths': []
+                            'apps': []
                         }
-                    installable_repos[repo_key]['apps'].append(app_name)
-                    installable_repos[repo_key]['paths'].append(app_info.get('path'))
-                    
-                    # Check secrets status
-                    secrets_status = self._check_repo_secrets_valid(owner, repo)
-                else:
-                    repo_status = "[red]Invalid format[/red]"
-                    secrets_status = "[red]N/A[/red]"
-            else:
-                repo_status = "[dim]None[/dim]"
-                secrets_status = "[dim]N/A[/dim]"
-            
-            app_table.add_row(str(idx), app_name, repo_status, secrets_status)
-        
-        self.console.print(app_table)
+                    installable_repos[repo_key]['apps'].append({
+                        'name': app_name,
+                        'path': app_info.get('path')
+                    })
         
         if not installable_repos:
-            self.console.print("\n[yellow]No apps with GitHub remotes - cannot install deploy secrets[/yellow]")
+            self.console.print("[yellow]No apps with GitHub repositories found[/yellow]")
             Prompt.ask("\nPress Enter to continue")
             return
         
-        # Allow selection of repos with GitHub remotes
-        repo_list = sorted(installable_repos.keys())
-        while True:
-            try:
-                choice = Prompt.ask("\nSelect repository (number) or [0] to go back")
-                choice_idx = int(choice)
-                
-                if choice_idx == 0:
-                    break
-                
-                if 1 <= choice_idx <= len(repo_list):
-                    repo_key = repo_list[choice_idx - 1]
-                    repo_info = installable_repos[repo_key]
-                    
-                    self._install_secrets_for_repo(
-                        repo_info['owner'],
-                        repo_info['repo'],
-                        repo_info['apps'],
-                        repo_info['paths']
-                    )
-                    break
-                else:
-                    self.console.print("[red]Invalid selection[/red]")
-            except ValueError:
-                self.console.print("[red]Please enter a valid number[/red]")
-    
-    def _check_repo_secrets_valid(self, owner: str, repo: str) -> str:
-        """Check if all required deploy secrets are installed and valid"""
-        try:
-            secrets = self.secrets_manager.list_secrets(owner, repo)
-            existing_names = {s['name'].upper() for s in secrets}
+        self.console.print(f"[cyan]Found {len(installable_repos)} repositor{'y' if len(installable_repos) == 1 else 'ies'} with deployed apps[/cyan]\n")
+        
+        table = Table(title="Auto-Installing Secrets")
+        table.add_column("Repository", style="cyan")
+        table.add_column("Apps", style="yellow")
+        table.add_column("Status", style="green")
+        
+        installation_results = []
+        
+        for repo_key, repo_info in sorted(installable_repos.items()):
+            owner = repo_info['owner']
+            repo = repo_info['repo']
+            app_names = [a['name'] for a in repo_info['apps']]
+            app_paths = [a['path'] for a in repo_info['apps']]
             
-            required_secrets = {
-                'DEPLOY_SSH_KEY',
-                'DEPLOY_HOST',
-                'DEPLOY_USER',
-                'DEPLOY_PORT',
-                'DEPLOY_PATH'
-            }
+            apps_str = ", ".join(app_names)
             
-            if required_secrets.issubset(existing_names):
-                return "[green]✓ Complete[/green]"
+            result = self._auto_install_secrets_for_repo(owner, repo, app_names, app_paths)
+            status = "[green]✓ Success[/green]" if result['success'] else "[red]✗ Failed[/red]"
             
-            found = len(required_secrets & existing_names)
-            missing = len(required_secrets - existing_names)
-            return f"[yellow]{found}/5[/yellow]"
-        except Exception:
-            return "[red]✗ Error[/red]"
-    
-    def _install_secrets_for_repo(self, owner: str, repo: str, app_names: list, app_paths: list):
-        """Install deploy secrets for a specific repository"""
+            table.add_row(repo_key, apps_str, status)
+            installation_results.append(result)
+        
         self.console.clear()
+        self.console.print(table)
         
-        # Show what secrets are needed
-        info_table = Table(title=f"Deploy Secrets for {owner}/{repo}")
-        info_table.add_column("Secret", style="cyan", width=20)
-        info_table.add_column("Purpose", style="yellow", width=40)
-        info_table.add_column("Status", style="green", width=15)
+        success_count = sum(1 for r in installation_results if r['success'])
+        total_count = len(installation_results)
         
-        existing_secrets = self.secrets_manager.list_secrets(owner, repo)
-        existing_names = {s['name'].upper() for s in existing_secrets}
+        self.console.print(f"\n[cyan]Installation Summary:[/cyan]")
+        self.console.print(f"  Successful: [green]{success_count}[/green]/{total_count}")
+        self.console.print(f"  Failed: [red]{total_count - success_count}[/red]/{total_count}")
         
-        deploy_secret_defs = [
-            ('DEPLOY_SSH_KEY', 'SSH private key for VPS authentication'),
-            ('DEPLOY_HOST', 'VPS hostname or IP address'),
-            ('DEPLOY_USER', 'SSH username for VPS access'),
-            ('DEPLOY_PORT', 'SSH port (usually 2223)'),
-            ('DEPLOY_PATH', 'Deployment path on VPS'),
-        ]
-        
-        for secret_name, purpose in deploy_secret_defs:
-            status = "[green]✓ Installed[/green]" if secret_name in existing_names else "[yellow]⚠ Missing[/yellow]"
-            info_table.add_row(secret_name, purpose, status)
-        
-        self.console.print(info_table)
-        
-        self.console.print(f"\n[cyan]Deployed apps: {', '.join(app_names)}[/cyan]")
-        self.console.print(f"[cyan]Deploy paths: {', '.join(app_paths)}[/cyan]\n")
-        
-        # Offer to install missing secrets
-        missing_secrets = [name for name, _ in deploy_secret_defs if name not in existing_names]
-        
-        if missing_secrets:
-            self.console.print(f"[yellow]Found {len(missing_secrets)} missing secret(s)[/yellow]\n")
-            
-            if Confirm.ask("Install missing secrets?"):
-                self._prompt_and_install_secrets(owner, repo, missing_secrets, app_paths)
-            else:
-                Prompt.ask("\nPress Enter to continue")
-        else:
-            self.console.print("[green]✓ All deploy secrets are installed[/green]")
-            Prompt.ask("\nPress Enter to continue")
-    
-    def _prompt_and_install_secrets(self, owner: str, repo: str, secrets_to_install: list, app_paths: list):
-        """Prompt user and install deploy secrets"""
-        self.console.clear()
-        self.console.print(f"[bold]Installing Deploy Secrets for {owner}/{repo}[/bold]\n")
-        
-        secrets_values = {}
-        
-        for secret_name in secrets_to_install:
-            if secret_name == 'DEPLOY_SSH_KEY':
-                self.console.print("[cyan]DEPLOY_SSH_KEY[/cyan]: SSH private key for GitHub Actions to authenticate to VPS")
-                try:
-                    key_path = Path(VPS_SSH_KEY)
-                    if key_path.exists():
-                        use_local = Confirm.ask(f"Use local SSH key from {VPS_SSH_KEY}?", default=True)
-                        if use_local:
-                            with open(key_path, 'r') as f:
-                                secrets_values[secret_name] = f.read()
-                            self.console.print("[green]✓ Loaded SSH key from local file[/green]")
-                        else:
-                            secrets_values[secret_name] = Prompt.ask("Paste SSH private key (multi-line)", password=False)
-                    else:
-                        secrets_values[secret_name] = Prompt.ask("Paste SSH private key (multi-line)", password=False)
-                except Exception as e:
-                    self.console.print(f"[yellow]Error reading SSH key: {e}[/yellow]")
-                    secrets_values[secret_name] = Prompt.ask("Paste SSH private key (multi-line)", password=False)
-            
-            elif secret_name == 'DEPLOY_HOST':
-                self.console.print(f"\n[cyan]DEPLOY_HOST[/cyan]: VPS hostname/IP (default: {VPS_HOST})")
-                value = Prompt.ask("VPS host", default=VPS_HOST)
-                secrets_values[secret_name] = value
-            
-            elif secret_name == 'DEPLOY_USER':
-                self.console.print(f"\n[cyan]DEPLOY_USER[/cyan]: SSH username (default: {VPS_SSH_USERNAME})")
-                value = Prompt.ask("SSH username", default=VPS_SSH_USERNAME)
-                secrets_values[secret_name] = value
-            
-            elif secret_name == 'DEPLOY_PORT':
-                self.console.print(f"\n[cyan]DEPLOY_PORT[/cyan]: SSH port (default: {VPS_SSH_PORT})")
-                value = Prompt.ask("SSH port", default=str(VPS_SSH_PORT))
-                secrets_values[secret_name] = value
-            
-            elif secret_name == 'DEPLOY_PATH':
-                paths_str = ", ".join(app_paths) if app_paths else "/home/deployer/apps"
-                self.console.print(f"\n[cyan]DEPLOY_PATH[/cyan]: Deployment directory on VPS")
-                self.console.print(f"[dim]Discovered paths: {paths_str}[/dim]")
-                value = Prompt.ask("Deploy path", default=app_paths[0] if app_paths else "/home/deployer/apps")
-                secrets_values[secret_name] = value
-        
-        # Install all secrets
-        self.console.print("\n[cyan]Installing secrets to GitHub...[/cyan]\n")
-        
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            console=self.console
-        ) as progress:
-            for secret_name in secrets_to_install:
-                task = progress.add_task(f"Installing {secret_name}...", total=None)
-                
-                if self.secrets_manager.create_secret(owner, repo, secret_name, secrets_values[secret_name]):
-                    progress.update(task, completed=True, description=f"[green]✓ {secret_name}[/green]")
-                else:
-                    progress.update(task, completed=True, description=f"[red]✗ {secret_name}[/red]")
-        
-        self.console.print("\n[green]Deploy secrets installation complete![/green]")
-        self.console.print("\n[cyan]Your GitHub Actions workflows can now use:[/cyan]")
-        self.console.print("  ${{ secrets.DEPLOY_SSH_KEY }}")
-        self.console.print("  ${{ secrets.DEPLOY_HOST }}")
-        self.console.print("  ${{ secrets.DEPLOY_USER }}")
-        self.console.print("  ${{ secrets.DEPLOY_PORT }}")
-        self.console.print("  ${{ secrets.DEPLOY_PATH }}")
+        if installation_results:
+            self.console.print(f"\n[cyan]Details:[/cyan]")
+            for result in installation_results:
+                self.console.print(f"  {result['repo_key']}: {result['message']}")
         
         Prompt.ask("\nPress Enter to continue")
+    
+    def _auto_install_secrets_for_repo(self, owner: str, repo: str, app_names: list, app_paths: list) -> Dict:
+        """Automatically install all deploy secrets for a repository"""
+        repo_key = f"{owner}/{repo}"
+        
+        try:
+            secrets_values = {}
+            
+            secrets_values['DEPLOY_SSH_KEY'] = self._get_ssh_key_value()
+            secrets_values['DEPLOY_HOST'] = VPS_HOST
+            secrets_values['DEPLOY_USER'] = VPS_SSH_USERNAME
+            secrets_values['DEPLOY_PORT'] = str(VPS_SSH_PORT)
+            
+            if app_paths and app_paths[0]:
+                secrets_values['DEPLOY_PATH'] = app_paths[0]
+            else:
+                return {
+                    'success': False,
+                    'repo_key': repo_key,
+                    'message': 'Could not determine deploy path'
+                }
+            
+            existing_secrets = self.secrets_manager.list_secrets(owner, repo)
+            existing_names = {s['name'].upper() for s in existing_secrets}
+            
+            secrets_to_install = [
+                (name, value) for name, value in secrets_values.items()
+                if name not in existing_names
+            ]
+            
+            if not secrets_to_install:
+                return {
+                    'success': True,
+                    'repo_key': repo_key,
+                    'message': 'All secrets already installed'
+                }
+            
+            installed_count = 0
+            failed_count = 0
+            
+            for secret_name, secret_value in secrets_to_install:
+                if self.secrets_manager.create_secret(owner, repo, secret_name, secret_value):
+                    installed_count += 1
+                else:
+                    failed_count += 1
+            
+            if failed_count == 0:
+                return {
+                    'success': True,
+                    'repo_key': repo_key,
+                    'message': f'Installed {installed_count} secret(s)'
+                }
+            else:
+                return {
+                    'success': False,
+                    'repo_key': repo_key,
+                    'message': f'Installed {installed_count}, failed {failed_count}'
+                }
+        
+        except Exception as e:
+            return {
+                'success': False,
+                'repo_key': repo_key,
+                'message': f'Error: {str(e)}'
+            }
+    
+    def _get_ssh_key_value(self) -> str:
+        """Get SSH key value from configured path"""
+        try:
+            key_path = Path(VPS_SSH_KEY)
+            if key_path.exists():
+                with open(key_path, 'r') as f:
+                    return f.read()
+            else:
+                raise FileNotFoundError(f"SSH key not found at {VPS_SSH_KEY}")
+        except Exception as e:
+            self.console.print(f"[red]Error reading SSH key: {e}[/red]")
+            raise
     
 
     def replicate_menu(self):
